@@ -1,0 +1,201 @@
+/**
+ * HS BRAND — Main Entrypoint
+ * Handles:
+ * - Discord client init
+ * - Lavalink (Shoukaku v4) init
+ * - Express health server
+ * - Hybrid command loader (prefix + slash)
+ * - Auto reconnect & Lavalink resume
+ * - Voice state handlers
+ * - Graceful shutdown
+ */
+
+const { Client, Collection, GatewayIntentBits, Partials } = require("discord.js");
+const { Shoukaku, Connectors } = require("shoukaku");
+const startExpress = require("./server");
+const config = require("./config");
+const logger = require("./logger");
+const path = require("path");
+const fs = require("fs");
+
+// ------------------------------------------------------------
+// 1. DISCORD CLIENT SETUP
+// ------------------------------------------------------------
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.User, Partials.Message, Partials.Channel]
+});
+
+client.commands = new Collection();          // Slash commands
+client.prefixCommands = new Collection();    // Prefix commands
+client.queue = new Map();                    // Per-guild queue cache
+
+// ------------------------------------------------------------
+// 2. COMMAND LOADER (HYBRID)
+// ------------------------------------------------------------
+
+function loadPrefixCommands() {
+  const cmdPath = path.join(__dirname, "commands");
+  if (!fs.existsSync(cmdPath)) return;
+
+  for (const file of fs.readdirSync(cmdPath)) {
+    if (!file.endsWith(".js")) continue;
+    const command = require(`${cmdPath}/${file}`);
+    client.prefixCommands.set(command.name, command);
+  }
+
+  logger.success("Prefix commands loaded");
+}
+
+function loadSlashCommands() {
+  const slashPath = path.join(__dirname, "slash");
+  if (!fs.existsSync(slashPath)) return;
+
+  for (const file of fs.readdirSync(slashPath)) {
+    if (!file.endsWith(".js")) continue;
+    const command = require(`${slashPath}/${file}`);
+    client.commands.set(command.data.name, command);
+  }
+
+  logger.success("Slash commands loaded");
+}
+
+// ------------------------------------------------------------
+// 3. LAVALINK (SHOUKAKU v4) SETUP
+// ------------------------------------------------------------
+
+const nodes = [
+  {
+    name: "main",
+    url: `${config.LAVALINK_HOST}:${config.LAVALINK_PORT}`,
+    auth: config.LAVALINK_PASSWORD,
+    secure: false,
+    resumeKey: "hsbrand",
+    resumeTimeout: 60
+  }
+];
+
+const shoukaku = new Shoukaku(
+  new Connectors.DiscordJS(client),
+  nodes,
+  {
+    resumable: true,
+    resumeKey: "hsbrand",
+    reconnectTries: 10,
+    reconnectInterval: 3000,
+    moveOnDisconnect: true
+  }
+);
+
+client.shoukaku = shoukaku;
+
+// Lavalink event logging
+shoukaku.on("ready", (name) => logger.success(`Lavalink Node "${name}" connected`));
+shoukaku.on("error", (name, error) => logger.error(`Lavalink Error @ ${name}: ${error}`));
+shoukaku.on("close", (name, code, reason) =>
+  logger.warn(`Lavalink Node "${name}" closed: ${code} — ${reason}`)
+);
+
+// ------------------------------------------------------------
+// 4. EVENT HANDLERS
+// ------------------------------------------------------------
+
+// Slash commands
+client.on("interactionCreate", async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+
+  const command = client.commands.get(interaction.commandName);
+  if (!command) return;
+
+  try {
+    await command.execute(interaction, client);
+  } catch (err) {
+    logger.error(err);
+    interaction.reply({ content: "❌ Error executing command.", ephemeral: true });
+  }
+});
+
+// Prefix commands
+client.on("messageCreate", async (msg) => {
+  if (!msg.guild || !msg.content.startsWith(config.PREFIX)) return;
+
+  const args = msg.content.slice(config.PREFIX.length).trim().split(/ +/);
+  const cmdName = args.shift().toLowerCase();
+  const cmd = client.prefixCommands.get(cmdName);
+
+  if (!cmd) return;
+
+  try {
+    await cmd.run(msg, args, client);
+  } catch (err) {
+    logger.error(err);
+    msg.reply("❌ Error executing command.");
+  }
+});
+
+// Voice state updates (auto-disconnect logic)
+client.on("voiceStateUpdate", (oldState, newState) => {
+  // No stale queues
+  const queue = client.queue.get(newState.guild.id);
+  if (!queue) return;
+
+  const botLeft = oldState.channelId && !newState.channelId && oldState.member.id === client.user.id;
+  if (botLeft) {
+    client.queue.delete(newState.guild.id);
+    logger.warn("Cleared queue after bot left VC");
+  }
+});
+
+// ------------------------------------------------------------
+// 5. READY EVENT
+// ------------------------------------------------------------
+
+client.once("ready", async () => {
+  logger.success(`HS BRAND is online as ${client.user.tag}`);
+
+  loadPrefixCommands();
+  loadSlashCommands();
+
+  logger.info("Hybrid command system initialized");
+});
+
+// ------------------------------------------------------------
+// 6. EXPRESS HEALTH SERVER
+// ------------------------------------------------------------
+
+startExpress(client, shoukaku);
+
+// ------------------------------------------------------------
+// 7. CLEAN SHUTDOWN
+// ------------------------------------------------------------
+
+async function shutdown() {
+  logger.warn("Shutting down...");
+
+  try {
+    for (const player of client.shoukaku.players.values()) {
+      await player.connection.disconnect();
+    }
+
+    await client.destroy();
+  } catch (err) {
+    logger.error(err);
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+// ------------------------------------------------------------
+// 8. LOGIN
+// ------------------------------------------------------------
+
+client.login(config.DISCORD_TOKEN);
